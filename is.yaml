@@ -41,6 +41,14 @@ Parameters:
     Type: String
     Description: "IDC application ARN used for create_token_with_iam"
 
+  EnterpriseIdcRedirectUri:
+    Type: String
+    Description: "Redirect URI for IDC token exchange"
+
+  TenantId:
+    Type: String
+    Description: "Tenant identifier provided by the ISV"
+
   S3ReactScriptBucket:
     Type: String
     Description: "Bucket that holds install_react.sh"
@@ -330,6 +338,7 @@ Resources:
                 Action:
                   - "sts:AssumeRole"
                   - "sts:SetContext"
+                  - "sts:TagSession"
                 Resource: "*"
               - Effect: "Allow"
                 Action:
@@ -375,6 +384,8 @@ Resources:
           REGION: !Ref AWS::Region
           Q_SERVICE_ROLE_ARN: !Ref QBusinessCrossAccountRoleArn
           IDC_CLIENT_ID: !Ref EnterpriseIdcApplicationArn
+          IDC_REDIRECT_URI: !Ref EnterpriseIdcRedirectUri
+          TENANT_ID: !Ref TenantId
       Code:
         ZipFile: |
           import json
@@ -385,10 +396,14 @@ Resources:
 
           def handler(event, context):
               body = json.loads(event.get("body", "{}"))
-              headers = event.get("headers", {})
-              id_token = headers.get("Authorization", "")
+              region = os.environ["REGION"]
+              q_role_arn = os.environ["Q_SERVICE_ROLE_ARN"]   # cross-account QBusiness role
+              idc_client_id = os.environ["IDC_CLIENT_ID"]     # enterprise IDC app
+              redirect_uri = os.environ.get("IDC_REDIRECT_URI", "")
+              tenant_id = os.environ.get("TENANT_ID", "")
 
-              if not id_token:
+              code = (event.get("queryStringParameters", {}) or {}).get("code") or body.get("code")
+              if not code:
                   return {
                       "statusCode": 400,
                       "headers": {
@@ -396,27 +411,36 @@ Resources:
                           "Access-Control-Allow-Origin": "*",
                           "Access-Control-Allow-Headers": "Content-Type,Authorization"
                       },
-                      "body": json.dumps({"error": "Missing Authorization header"})
+                      "body": json.dumps({"error": "Missing code"})
                   }
 
-              region = os.environ["REGION"]
-              q_role_arn = os.environ["Q_SERVICE_ROLE_ARN"]   # cross-account QBusiness role
-              idc_client_id = os.environ["IDC_CLIENT_ID"]     # enterprise IDC app
-
-              sso_oidc = boto3.client("sso-oidc", region_name=region, config=Config(signature_version='v4'))
-              # Step 1: create_token_with_iam using the Cognito/IDC token
+              sts = boto3.client("sts", region_name=region)
+              pre_resp = sts.assume_role(
+                  RoleArn=q_role_arn,
+                  RoleSessionName="TokenExchangeInit",
+                  Tags=[{"Key": "qbusiness-dataaccessor:ExternalId", "Value": tenant_id}]
+              )
+              pre_creds = pre_resp["Credentials"]
+              sso_oidc = boto3.client(
+                  "sso-oidc",
+                  region_name=region,
+                  aws_access_key_id=pre_creds["AccessKeyId"],
+                  aws_secret_access_key=pre_creds["SecretAccessKey"],
+                  aws_session_token=pre_creds["SessionToken"],
+                  config=Config(signature_version='v4')
+              )
+              # Step 1: create_token_with_iam using the authorization code
               idc_resp = sso_oidc.create_token_with_iam(
                   clientId=idc_client_id,
-                  grantType="urn:ietf:params:oauth:grant-type:jwt-bearer",
-                  assertion=id_token
+                  grantType="authorization_code",
+                  code=code,
+                  redirectUri=redirect_uri
               )
               iam_token = idc_resp["idToken"]
 
               # Step 2: assumeRole with ProvidedContexts
-              sts = boto3.client("sts", region_name=region)
               parts = iam_token.split(".")
               payload_decoded = json.loads(base64.b64decode(parts[1] + "==="))
-
               sts_resp = sts.assume_role(
                   RoleArn=q_role_arn,
                   RoleSessionName="TokenExchange",
@@ -425,7 +449,8 @@ Resources:
                           "ProviderArn": "arn:aws:iam::aws:contextProvider/IdentityCenter",
                           "ContextAssertion": payload_decoded["sts:identity_context"],
                       }
-                  ]
+                  ],
+                  Tags=[{"Key": "qbusiness-dataaccessor:ExternalId", "Value": tenant_id}]
               )
               creds = sts_resp["Credentials"]
 
