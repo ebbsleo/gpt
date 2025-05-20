@@ -1,0 +1,962 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ISV CloudFormation Stack
+  1) EC2 + ALB hosting React
+  2) Two Lambdas + API Gateway for /token-exchange & /chat
+  3) Usage logger (DynamoDB + SNS)
+  4) Cross-account QBusiness calls
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: "Amazon Linux 2023 AMI"
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID for the ALB + EC2"
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "List of public subnets"
+
+  CertificateARN:
+    Type: String
+    Description: "ACM Certificate ARN for the ALB"
+
+  # Cross-account parameters for QBusiness
+  EnterpriseQApplicationId:
+    Type: String
+    Description: "QBusiness ApplicationId from enterprise"
+
+  EnterpriseQRetrieverId:
+    Type: String
+    Description: "QBusiness RetrieverId from enterprise"
+
+  QBusinessCrossAccountRoleArn:
+    Type: String
+    Description: "ARN of the cross-account role that has QBusiness perms (in enterprise account)"
+
+  EnterpriseIdcApplicationArn:
+    Type: String
+    Description: "IDC application ARN used for create_token_with_iam"
+
+  S3ReactScriptBucket:
+    Type: String
+    Description: "Bucket that holds install_react.sh"
+
+  S3ReactScriptKey:
+    Type: String
+    Description: "Key path to install_react.sh"
+
+  NativeKbId:
+    Type: String
+    Description: "Bedrock Knowledge Base ID for any native ISV data"
+    Default: "my-native-kb"
+
+  BedrockModelID:
+    Type: String
+    Description: "Bedrock Model ID for the LLM"
+    Default: "amazon.nova-lite-v1:0"
+
+  DemoNotificationEmail:
+    Type: String
+    Description: "Email address for usage notifications"
+
+Resources:
+  ################################################################
+  # 1) EC2 Role + Policies
+  ################################################################
+  EC2ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ "ec2.amazonaws.com" ]
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  EC2ServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles: [ !Ref EC2ServiceRole ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # The instance might need to call the token exchange or anything else
+          - Sid: AllowTokenExchange
+            Effect: Allow
+            Action: [ "sso-oauth:CreateTokenWithIAM" ]
+            Resource: "*"
+
+          - Sid: AllowBedrock
+            Effect: Allow
+            Action: [ "bedrock:InvokeModel" ]
+            Resource: "*"
+
+          - Sid: AllowS3ReadOnly
+            Effect: Allow
+            Action: [ "s3:Get*", "s3:ListBucket" ]
+            Resource: "*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles: [ !Ref EC2ServiceRole ]
+
+  ################################################################
+  # 2) ALB + Security Groups
+  ################################################################
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ELB SG"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "EC2 SG"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ELBSecurityGroup
+
+  ELBSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ELBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      DestinationSecurityGroupId: !Ref EC2SecurityGroup
+
+  EC2SecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "ISV-Demo-ALB"
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+
+  EC2TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Port: 8080
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "60"
+
+  ALBListener80:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          Order: 1
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: "HTTP_301"
+
+  ALBListener443:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateARN
+      DefaultActions:
+        - Type: forward
+          Order: 1
+          TargetGroupArn: !Ref EC2TargetGroup
+      SslPolicy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+
+  ################################################################
+  # 3) LowerCaseFQDN (Custom Resource)
+  ################################################################
+  LowerCaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ "lambda.amazonaws.com" ]
+            Action: [ "sts:AssumeRole" ]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Path: "/"
+
+  LowerCaseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LowerCaseRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          def handler(event, context):
+              if event["RequestType"] in ["Create", "Update"]:
+                  input_val = event['ResourceProperties']['Input'].lower()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Output": input_val})
+              elif event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Runtime: python3.9
+      Timeout: 30
+
+  LowerCaseFqdn:
+    Type: Custom::LowerCaseFqdn
+    Properties:
+      ServiceToken: !GetAtt LowerCaseFunction.Arn
+      Input: !GetAtt ApplicationLoadBalancer.DNSName
+
+  ################################################################
+  # 4) Launch Template + ASG for EC2 React server
+  ################################################################
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [ !Ref EC2SecurityGroup ]
+            SubnetId: !Select [0, !Ref PublicSubnetIds]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            export SERVICE_REGION=${AWS::Region}
+
+            # Download script from S3
+            aws s3 cp s3://${S3ReactScriptBucket}/${S3ReactScriptKey} /tmp/install_react.sh
+            chmod +x /tmp/install_react.sh
+            /tmp/install_react.sh
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      DesiredCapacity: 1
+      MinSize: 1
+      MaxSize: 1
+      TargetGroupARNs:
+        - !Ref EC2TargetGroup
+      HealthCheckType: "ELB"
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: !Sub "ReactUI-${AWS::StackName}"
+          PropagateAtLaunch: true
+
+  ################################################################
+  # 5) Lambda Execution Role
+  ################################################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ "lambda.amazonaws.com" ]
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "sso-oauth:CreateTokenWithIAM"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sts:AssumeRole"
+                  - "sts:SetContext"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "bedrock:InvokeModel"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "dynamodb:PutItem"
+                Resource: !GetAtt DemoUsageTable.Arn
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref DemoLoggerTopic
+
+  MyBoto3Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: "boto3-latest-layer"
+      Description: "A layer with the latest boto3 for python3.x"
+      Content:
+        S3Bucket: q-index-demo-react-ebbeytt
+        S3Key: boto-layer/layer.zip
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+        - python3.12
+
+  ################################################################
+  # 6) TokenExchangeFunction
+  ################################################################
+  TokenExchangeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Layers:
+        - !Ref MyBoto3Layer
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          Q_SERVICE_ROLE_ARN: !Ref QBusinessCrossAccountRoleArn
+          IDC_CLIENT_ID: !Ref EnterpriseIdcApplicationArn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import base64
+          import boto3
+          from botocore.config import Config
+
+          def handler(event, context):
+              body = json.loads(event.get("body", "{}"))
+              headers = event.get("headers", {})
+              id_token = headers.get("Authorization", "")
+
+              if not id_token:
+                  return {
+                      "statusCode": 400,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Headers": "Content-Type,Authorization"
+                      },
+                      "body": json.dumps({"error": "Missing Authorization header"})
+                  }
+
+              region = os.environ["REGION"]
+              q_role_arn = os.environ["Q_SERVICE_ROLE_ARN"]   # cross-account QBusiness role
+              idc_client_id = os.environ["IDC_CLIENT_ID"]     # enterprise IDC app
+
+              sso_oidc = boto3.client("sso-oidc", region_name=region, config=Config(signature_version='v4'))
+              # Step 1: create_token_with_iam using the Cognito/IDC token
+              idc_resp = sso_oidc.create_token_with_iam(
+                  clientId=idc_client_id,
+                  grantType="urn:ietf:params:oauth:grant-type:jwt-bearer",
+                  assertion=id_token
+              )
+              iam_token = idc_resp["idToken"]
+
+              # Step 2: assumeRole with ProvidedContexts
+              sts = boto3.client("sts", region_name=region)
+              parts = iam_token.split(".")
+              payload_decoded = json.loads(base64.b64decode(parts[1] + "==="))
+
+              sts_resp = sts.assume_role(
+                  RoleArn=q_role_arn,
+                  RoleSessionName="TokenExchange",
+                  ProvidedContexts=[
+                      {
+                          "ProviderArn": "arn:aws:iam::aws:contextProvider/IdentityCenter",
+                          "ContextAssertion": payload_decoded["sts:identity_context"],
+                      }
+                  ]
+              )
+              creds = sts_resp["Credentials"]
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "Content-Type,Authorization"
+                  },
+                  "body": json.dumps({
+                      "stsCredentials": {
+                          "accessKeyId": creds["AccessKeyId"],
+                          "secretAccessKey": creds["SecretAccessKey"],
+                          "sessionToken": creds["SessionToken"],
+                          "expiration": creds["Expiration"].isoformat()
+                      }
+                  })
+              }
+
+  ################################################################
+  # 7) ChatbotFunction
+  ################################################################
+  ChatbotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Layers:
+        - !Ref MyBoto3Layer
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          Q_APPLICATION_ID: !Ref EnterpriseQApplicationId
+          Q_RETRIEVER_ID: !Ref EnterpriseQRetrieverId
+          BEDROCK_REGION: "us-east-1"
+          BEDROCK_MODEL_ID: !Ref BedrockModelID
+          NATIVE_KB_ID: !Ref NativeKbId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import random
+
+          def call_bedrock_with_retry(client, **kwargs):
+              max_tries = 5
+              for attempt in range(1, max_tries + 1):
+                  try:
+                      return client.converse(**kwargs)
+                  except client.exceptions.ThrottlingException as e:
+                      if attempt == max_tries:
+                          raise
+                      sleep_time = (2 ** attempt) + random.random()
+                      time.sleep(sleep_time)
+
+          def build_date_filters_for_year(year_str):
+              if not year_str: return []
+              try:
+                  y = int(year_str)
+              except ValueError:
+                  return []
+              from datetime import datetime
+              from_date = datetime(y, 1, 1, 0, 0, 0).isoformat() + "Z"
+              to_date   = datetime(y, 12, 31, 23, 59, 59).isoformat() + "Z"
+              return [
+                  {"greaterThanOrEquals": {"name": "_created_at", "value": {"dateValue": from_date}}},
+                  {"lessThanOrEquals":   {"name": "_created_at", "value": {"dateValue": to_date}}},
+              ]
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get("body", "{}"))
+                  user_query = body.get("query", "").strip()
+                  if not user_query:
+                      return {
+                          "statusCode": 400,
+                          "headers": {
+                              "Content-Type": "application/json",
+                              "Access-Control-Allow-Origin": "*"
+                          },
+                          "body": json.dumps({"error": "No query provided"})
+                      }
+
+                  creds = body.get("stsCredentials", {})
+                  if not creds:
+                      return {
+                          "statusCode": 400,
+                          "headers": {
+                              "Content-Type": "application/json",
+                              "Access-Control-Allow-Origin": "*"
+                          },
+                          "body": json.dumps({"error": "Missing STS credentials"})
+                      }
+
+                  region = os.environ["REGION"]
+                  q_app_id = os.environ["Q_APPLICATION_ID"]
+                  q_retriever_id = os.environ.get("Q_RETRIEVER_ID", "")
+                  bedrock_region = os.environ.get("BEDROCK_REGION", "us-east-1")
+                  bedrock_model_id = os.environ.get("BEDROCK_MODEL_ID", "")
+                  native_kb_id = os.environ.get("NATIVE_KB_ID", "default-kb")
+
+                  q_index_enabled = body.get("qIndexEnabled", False)
+                  selected_country = body.get("country", "").strip()
+                  selected_year = body.get("year", "").strip()
+
+                  # 1) Call "native" bedrock-agent runtime (if you have some local knowledge base)
+                  agent_client = boto3.client(
+                      "bedrock-agent-runtime",
+                      region_name=bedrock_region,
+                      aws_access_key_id=creds["accessKeyId"],
+                      aws_secret_access_key=creds["secretAccessKey"],
+                      aws_session_token=creds["sessionToken"]
+                  )
+                  native_resp = agent_client.retrieve(
+                      knowledgeBaseId=native_kb_id,
+                      retrievalQuery={"text": user_query},
+                      retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 5}}
+                  )
+                  native_docs = native_resp.get("retrievalResults", [])
+                  native_context_parts = []
+                  native_source_links = []
+                  for i, ndoc in enumerate(native_docs):
+                      doc_text = ndoc.get("content", {}).get("text", "")
+                      native_context_parts.append(doc_text)
+                      link = ndoc.get("location", {}).get("s3Location", {}).get("uri") or "#"
+                      native_source_links.append({"url": link, "title": link})
+
+                  combined_context = "\n".join(native_context_parts)
+                  combined_source_links = native_source_links
+
+                  # 2) Optionally call QBusiness if qIndexEnabled
+                  if q_index_enabled:
+                      qb_client = boto3.client(
+                          "qbusiness",
+                          region_name=region,
+                          aws_access_key_id=creds["accessKeyId"],
+                          aws_secret_access_key=creds["secretAccessKey"],
+                          aws_session_token=creds["sessionToken"]
+                      )
+                      q_search_args = {
+                          "applicationId": q_app_id,
+                          "queryText": user_query,
+                          "contentSource": {"retriever": {"retrieverId": q_retriever_id}},
+                          "maxResults": 5
+                      }
+
+                      # Build filters
+                      filters_list = []
+                      if selected_country:
+                          filters_list.append({
+                              "equalsTo": {
+                                  "name": "country",
+                                  "value": {"stringValue": selected_country}
+                              }
+                          })
+
+                      year_filters = build_date_filters_for_year(selected_year)
+                      filters_list.extend(year_filters)
+
+                      if len(filters_list) == 1:
+                          q_search_args["attributeFilter"] = filters_list[0]
+                      elif len(filters_list) > 1:
+                          q_search_args["attributeFilter"] = {"andAllFilters": filters_list}
+
+                      q_resp = qb_client.search_relevant_content(**q_search_args)
+                      relevant = q_resp.get("relevantContent", [])
+
+                      # Combine relevant docs
+                      q_context_parts = []
+                      q_source_links = []
+                      for i, doc in enumerate(relevant):
+                          text = doc.get("content", "")
+                          q_context_parts.append(text)
+                          doc_url = doc.get("documentUri", "#")
+                          q_source_links.append({"url": doc_url, "title": doc_url})
+                      if q_context_parts:
+                          combined_context += "\n" + "\n".join(q_context_parts)
+                      combined_source_links.extend(q_source_links)
+
+                  if not combined_context.strip():
+                      return {
+                          "statusCode": 200,
+                          "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                          "body": json.dumps({
+                              "response": "No relevant content found.",
+                              "sourceLinks": []
+                          })
+                      }
+
+                  # Deduplicate source links
+                  seen = set()
+                  unique_links = []
+                  for link in combined_source_links:
+                      url = link.get("url", "")
+                      if url not in seen:
+                          unique_links.append(link)
+                          seen.add(url)
+                  combined_source_links = unique_links
+
+                  # 3) Call Bedrock to get final answer
+                  br_client = boto3.client(
+                      "bedrock-runtime",
+                      region_name=bedrock_region,
+                      aws_access_key_id=creds["accessKeyId"],
+                      aws_secret_access_key=creds["secretAccessKey"],
+                      aws_session_token=creds["sessionToken"]
+                  )
+                  system_prompt = "You are a helpful AI assistant. Answer from the provided context only."
+                  user_content = f"Context:\n{combined_context}\n\nQuestion: {user_query}"
+
+                  resp = call_bedrock_with_retry(
+                      br_client,
+                      modelId=bedrock_model_id,
+                      messages=[{"role": "user", "content": [{"text": user_content}]}],
+                      system=[{"text": system_prompt}],
+                      inferenceConfig={"maxTokens": 750}
+                  )
+                  final_answer = "No message from Bedrock."
+                  if "output" in resp and "message" in resp["output"]:
+                      content_list = resp["output"]["message"].get("content", [])
+                      if content_list and isinstance(content_list, list) and len(content_list) > 0:
+                          final_answer = content_list[0].get("text", "No text returned.")
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({
+                          "response": final_answer,
+                          "sourceLinks": combined_source_links
+                      })
+                  }
+
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  ################################################################
+  # 8) API Gateway for /token-exchange and /chat
+  ################################################################
+  ChatbotApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-ChatbotApi"
+
+  # /token-exchange
+  TokenExchangeApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ParentId: !GetAtt ChatbotApi.RootResourceId
+      PathPart: "token-exchange"
+
+  TokenExchangeApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref TokenExchangeApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenExchangeFunction.Arn}/invocations"
+
+  TokenExchangeApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref TokenExchangeApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{ "statusCode": 200 }'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # /chat
+  ChatbotApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ParentId: !GetAtt ChatbotApi.RootResourceId
+      PathPart: "chat"
+
+  ChatbotApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref ChatbotApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatbotFunction.Arn}/invocations"
+
+  ChatbotApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref ChatbotApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{ "statusCode": 200 }'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  TokenExchangeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenExchangeFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotApi}/*/POST/token-exchange"
+
+  ChatbotLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatbotFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotApi}/*/POST/chat"
+
+  ChatbotApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TokenExchangeApiMethod
+      - TokenExchangeApiOptionsMethod
+      - ChatbotApiMethod
+      - ChatbotApiOptionsMethod
+      - LogDemoApiMethod
+      - LogDemoApiOptionsMethod
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      StageName: "prod"
+
+  ################################################################
+  # 9) DynamoDB + SNS + Usage Logger
+  ################################################################
+  DemoUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "DemoUsageLogs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "id"
+          KeyType: "HASH"
+
+  DemoLoggerTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Demo Usage SNS Topic"
+
+  DemoLoggerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref DemoNotificationEmail
+      Protocol: email
+      TopicArn: !Ref DemoLoggerTopic
+
+  DemoLoggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "DemoLoggerFunction"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DemoUsageTable
+          SNS_TOPIC_ARN: !Ref DemoLoggerTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import uuid
+          import boto3
+
+          ddb = boto3.client("dynamodb")
+          sns = boto3.client("sns")
+
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+          def handler(event, context):
+              body_str = event.get("body", "{}")
+              body = json.loads(body_str)
+
+              demo_type = body.get("demoType", "")
+              customer_name = body.get("customerName", "")
+              field_alias = body.get("fieldAlias", "")
+
+              record_id = str(uuid.uuid4())
+              timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+              ddb.put_item(
+                  TableName=TABLE_NAME,
+                  Item={
+                      "id": {"S": record_id},
+                      "demoType": {"S": demo_type},
+                      "customerName": {"S": customer_name},
+                      "fieldAlias": {"S": field_alias},
+                      "createdAt": {"S": timestamp}
+                  }
+              )
+
+              message = (
+                  f"New demo usage log:\n"
+                  f"demoType: {demo_type}\n"
+                  f"customerName: {customer_name}\n"
+                  f"fieldAlias: {field_alias}\n"
+                  f"Timestamp: {timestamp}"
+              )
+              sns.publish(
+                  TopicArn=SNS_TOPIC_ARN,
+                  Subject="New Demo Usage",
+                  Message=message
+              )
+
+              return {
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*"
+                  },
+                  "body": json.dumps({"message": "Demo usage logged + email sent"})
+              }
+
+  # LogDemo API Resource
+  LogDemoApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ParentId: !GetAtt ChatbotApi.RootResourceId
+      PathPart: "log-demo"
+
+  LogDemoApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref LogDemoApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DemoLoggerFunction.Arn}/invocations"
+
+  LogDemoApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatbotApi
+      ResourceId: !Ref LogDemoApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LogDemoLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DemoLoggerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotApi}/*/POST/log-demo"
+
+Outputs:
+  URL:
+    Description: "Public URL of the React site behind the ALB"
+    Value: !Sub "https://${ApplicationLoadBalancer.DNSName}"
+
+  TokenExchangeEndpoint:
+    Description: "Endpoint for token-exchange (POST)"
+    Value: !Sub "https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/token-exchange"
+
+  ChatbotApiEndpoint:
+    Description: "Endpoint for the Chatbot Lambda (POST)"
+    Value: !Sub "https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat"
+
+  LogDemoEndpoint:
+    Description: "Endpoint for logging demo usage (POST)"
+    Value: !Sub "https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/log-demo"
